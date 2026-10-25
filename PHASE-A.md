@@ -1,33 +1,37 @@
 # Phase A — MVP
 
 **Status:** Pre-implementation  
+**Last updated:** 2026-10-25  
 **Depends on:** Nothing — this is the foundation  
 **Unlocks:** Phase B (sensors), all subsequent phases  
+**Walkthrough:** [PHASE-A-GUIDE.md](./PHASE-A-GUIDE.md)
 
 ---
 
 ## Scope
 
-Phase A produces the minimum working system. No voice, no AI, no Thread hardware. Just the data foundation running correctly and proven.
+Phase A produces the minimum working system. No voice, no AI, no Thread hardware. Just the data foundation running correctly and proven — including proof that the data survives a reinstall and that a backup can actually be restored.
 
 ### In scope
 
-- PostgreSQL running as a Docker container with persistent volume
-- `hass` read/write role and `hass_readonly` read-only role created at init
+- PostgreSQL running as a Docker container with a persistent volume
+- Three database roles created at init: the `postgres` superuser (admin only), `hass` (owner of the `homeassistant` database), and `hass_readonly` (read-only, used by Grafana)
+- An empty `terrarium` schema created at init, so Terrarium's own tables never share a schema with Home Assistant's recorder tables
 - Home Assistant Container running via Docker Compose
-- HA recorder writing state history to PostgreSQL (not SQLite)
-- Both Shelly Plug S 4th Gen units integrated via local Shelly integration
-- Grafana running with a provisioned PostgreSQL datasource and starter dashboard
-- Backup script exists, is documented, target is configurable via `.env` — not yet scheduled
+- HA recorder writing state history to PostgreSQL from first boot (no SQLite at any point)
+- Both Shelly Plug S 4th Gen units integrated via the local Shelly integration
+- Grafana with a provisioned PostgreSQL datasource and a starter dashboard
+- Backup script that dumps Postgres and archives HA's config directory — run manually, not yet scheduled
+- A tested restore procedure
 
 ### Explicitly out of scope
 
-- ALPSTUGA / Thread / OTBR / Matter server (Phase B)
-- Zigbee dongle (Phase C)
-- Voice pipeline — Whisper, Piper, Wyoming satellites (Phase C)
-- Intent router, curation worker, Ollama (Phase D)
-- Remote access, VPN, read API (Phase E)
-- Alembic migrations — custom Terrarium tables are not created yet; only HA recorder tables exist at this stage
+- ALPSTUGA, Thread, OTBR, Matter server (Phase B)
+- Voice pipeline (Phase C)
+- Ollama, curation worker, HA observer, Alembic-managed tables (Phase D)
+- Remote access, read API (Phase E)
+- Presence and MQTT (Phase F)
+- Backup scheduling and off-box targets
 
 ---
 
@@ -35,30 +39,33 @@ Phase A produces the minimum working system. No voice, no AI, no Thread hardware
 
 Phase A is complete when all of the following are true:
 
-- [ ] `docker compose up` starts all four services with no errors
+- [ ] `docker compose up -d` starts all three services (`postgres`, `homeassistant`, `grafana`) and `docker compose ps` shows them healthy
 - [ ] HA is reachable at `http://<server-ip>:8123`
-- [ ] HA recorder is writing to PostgreSQL — confirmed by querying the `states` table directly
-- [ ] Both Shelly plugs appear as entities in HA with live wattage readings
-- [ ] Grafana is reachable at `http://<server-ip>:3000`
-- [ ] Grafana PostgreSQL datasource connects successfully (green checkmark on test)
-- [ ] Grafana MVP dashboard loads and displays Shelly power data
-- [ ] `scripts/backup.sh` runs without error and produces a `.sql.gz` file
-- [ ] Reinstall test passes: bring stack down, delete HA config volume, bring back up, recorder resumes writing to same Postgres data
+- [ ] HA recorder is writing to PostgreSQL — `states` has rows, and the HA logs show no recorder errors
+- [ ] Both Shelly plugs appear in HA with live wattage readings
+- [ ] Grafana is reachable at `http://<server-ip>:3000` and its PostgreSQL datasource test passes
+- [ ] `hass_readonly` can `SELECT` from `states` (proves the default-privilege grants work) and cannot `INSERT`
+- [ ] The MVP dashboard shows Shelly power data and recorder health without editing any query
+- [ ] `scripts/backup.sh` produces a Postgres dump and an HA config archive
+- [ ] **Restore test passes:** the dump restores into a throwaway Postgres container and its `states` row count matches
+- [ ] **Reinstall test passes:** containers removed and the repo re-cloned; after setup and `up`, HA comes back with the same entities and users, and history continues unbroken
+- [ ] **Reboot test passes:** after a server reboot, all three services come back on their own
 
 ---
 
 ## Implementation Order
 
-Follow this order exactly. Each step depends on the previous one.
+Follow this order. Each step depends on the previous one.
 
-1. **`.env` and directory structure** — establish config paths, write `.env.example`
-2. **`db/init.sql`** — create roles, set permissions; runs automatically on first Postgres start
-3. **`docker-compose.yml`** — Postgres, HA, Grafana services only
-4. **`ha-config/configuration.yaml`** — recorder pointed at Postgres, exclusions, retention
-5. **`scripts/setup.sh`** — interactive first-run script; writes `.env`, validates prereqs
-6. **Grafana provisioning** — datasource YAML, dashboard YAML, dashboard JSON
-7. **`scripts/backup.sh`** — `pg_dump` wrapper, compress, rotate
-8. **Verify** — run through all success criteria
+1. **Shelly firmware** — update both plugs to current firmware before anything else (see Known Constraints)
+2. **`.env.example` and `.gitignore`** — document every variable; ignore `.env`
+3. **`db/init.sh`** — roles, database ownership, `terrarium` schema, read-only grants
+4. **`docker-compose.yml`** — `postgres`, `homeassistant`, `grafana`, with pinned image tags
+5. **`ha-config/configuration.yaml`** — template for the recorder and basic HA config
+6. **`scripts/setup.sh`** — writes `.env`, creates the data directories, links `.env` into the repo, seeds HA config and `secrets.yaml`
+7. **Grafana provisioning** — datasource YAML, dashboard provider YAML, dashboard JSON
+8. **`scripts/backup.sh` and `scripts/restore-test.sh`**
+9. **Verify** — every success criterion above
 
 ---
 
@@ -67,11 +74,12 @@ Follow this order exactly. Each step depends on the previous one.
 ```
 terrarium/
 ├── .env.example
+├── .gitignore                       # ignores .env (the symlink) and any local artifacts
 ├── docker-compose.yml
 ├── db/
-│   └── init.sql
+│   └── init.sh                      # .sh, not .sql — it reads passwords from the environment
 ├── ha-config/
-│   └── configuration.yaml
+│   └── configuration.yaml           # TEMPLATE — copied into the data root by setup.sh
 ├── grafana/
 │   └── provisioning/
 │       ├── datasources/
@@ -81,8 +89,39 @@ terrarium/
 │           └── terrarium-mvp.json
 └── scripts/
     ├── setup.sh
-    └── backup.sh
+    ├── backup.sh
+    └── restore-test.sh
 ```
+
+---
+
+## Where State Lives
+
+This is the most important section of Phase A. The repo holds only templates and code. Everything HA, Postgres, or Grafana writes at runtime lives under one data root.
+
+```
+~/.config/terrarium/
+└── .env                             # secrets + settings; the repo's .env is a symlink to this
+
+~/.local/share/terrarium/            # TERRARIUM_DATA — always written as an absolute path in .env
+├── postgres-data/                   # Postgres cluster
+├── ha-config/                       # HA's /config: configuration.yaml, secrets.yaml, .storage/
+└── grafana-data/                    # Grafana's internal DB (dashboards are provisioned, so this is low-value)
+```
+
+**What must survive a reinstall:**
+
+| Path | Why it matters |
+|---|---|
+| `postgres-data/` | All recorded history and long-term statistics |
+| `ha-config/.storage/` | HA's entity and device registries, users, auth, and integration entries. Lose this and every device gets re-added — often with new entity IDs (`_2` suffixes), which breaks dashboard queries and splits history |
+| `ha-config/secrets.yaml` | Recorder connection string and any other HA secrets |
+
+`grafana-data/` can be lost safely because the datasource and dashboard are provisioned from the repo.
+
+**Why not mount `./ha-config` from the repo directly:** HA writes `.storage/`, logs, and its own database files into its config directory. Mounting the repo there would put runtime state and secrets inside the git working tree and make "re-clone the repo" destroy HA's registries.
+
+**Why `TERRARIUM_DATA` must be absolute:** Docker Compose expands `~` relative to whichever user runs it. Run it once as root (via `sudo` or a system service) and every volume silently resolves under `/root` — Postgres starts empty, with no error.
 
 ---
 
@@ -90,49 +129,83 @@ terrarium/
 
 ### PostgreSQL
 
-- Image: `postgres:16`
-- Volume: `~/.local/share/terrarium/postgres-data/` — the only stateful artifact that must survive a reinstall
-- Exposed port: `5432` on localhost only — not accessible from outside the host
-- Init: `db/init.sql` runs automatically on first container start via the `docker-entrypoint-initdb.d` mechanism
-- Database name: `homeassistant`
-- Roles created at init:
-  - `hass` — read/write owner of the `homeassistant` database
-  - `hass_readonly` — `SELECT` only on all tables; used by Grafana
+- Image: `postgres:17` — pin to a major version; a major-version upgrade requires a dump and restore
+- Volume: `${TERRARIUM_DATA}/postgres-data` → `/var/lib/postgresql/data`
+- Published port: `127.0.0.1:5432:5432` — loopback only, so HA (host network) can reach it and nothing off the box can
+- Init: `db/init.sh` mounted into `/docker-entrypoint-initdb.d/`; runs only on the first start of an empty data directory
+- Health check: `pg_isready -U postgres`
+- Database: `homeassistant`, created by the image via `POSTGRES_DB`
+
+**Roles and grants created by `db/init.sh`:**
+
+```sql
+-- hass: owns the database, so it owns the public schema (Postgres 15+) and can create recorder tables
+CREATE ROLE hass WITH LOGIN PASSWORD :'hass_password';
+ALTER DATABASE homeassistant OWNER TO hass;
+
+-- Terrarium's own schema, empty until Phase D
+CREATE SCHEMA terrarium AUTHORIZATION hass;
+
+-- hass_readonly: SELECT only, now and for every table hass creates later
+CREATE ROLE hass_readonly WITH LOGIN PASSWORD :'readonly_password';
+GRANT CONNECT ON DATABASE homeassistant TO hass_readonly;
+GRANT USAGE ON SCHEMA public, terrarium TO hass_readonly;
+ALTER DEFAULT PRIVILEGES FOR ROLE hass IN SCHEMA public    GRANT SELECT ON TABLES TO hass_readonly;
+ALTER DEFAULT PRIVILEGES FOR ROLE hass IN SCHEMA terrarium GRANT SELECT ON TABLES TO hass_readonly;
+```
+
+The `FOR ROLE hass` clause is required. Default privileges apply only to objects created by the named role, and HA's recorder creates its tables as `hass`. Without it, `hass_readonly` gets "permission denied" on every recorder table and Grafana shows nothing. A plain `GRANT SELECT ON ALL TABLES` at init time grants nothing, because no tables exist yet.
+
+The passwords come from the environment (`HASS_DB_PASSWORD`, `HASS_READONLY_PASSWORD`) and are passed to `psql` as variables. No password is ever written into a file in the repo.
 
 ### Home Assistant Container
 
-- Image: `ghcr.io/home-assistant/home-assistant:stable`
-- Config volume: `./ha-config/` mapped to `/config` inside the container
-- Network mode: `host` — required for HA device discovery (mDNS, Shelly local API)
-- Depends on: `postgres` (health check)
-- Recorder configured in `ha-config/configuration.yaml` to write to Postgres from first boot — avoids SQLite entirely
+- Image: `ghcr.io/home-assistant/home-assistant` pinned to an exact release tag at implementation time — never `:stable` or `:latest`
+- Config volume: `${TERRARIUM_DATA}/ha-config` → `/config`
+- Network mode: `host` — required for mDNS discovery of the Shelly plugs (and later, Matter and Thread)
+- Depends on: `postgres` with `condition: service_healthy`
+- `TZ=UTC`
+- Recorder connection string: `postgresql://hass:<password>@127.0.0.1:5432/homeassistant`, stored in `secrets.yaml` and referenced as `!secret recorder_db_url`
+
+Note the `127.0.0.1`. A host-network container is not on the Compose network, so it cannot resolve the `postgres` service name.
 
 ### Grafana
 
-- Image: `grafana/grafana:latest`
-- Provisioning volume: `./grafana/provisioning/` mapped to `/etc/grafana/provisioning/`
-- Data volume: `~/.local/share/terrarium/grafana-data/`
-- Port: `3000`
-- Default credentials: set via `.env` (`GF_SECURITY_ADMIN_USER`, `GF_SECURITY_ADMIN_PASSWORD`)
-- Datasource and dashboard loaded automatically on first start — no manual UI setup required
+- Image: `grafana/grafana` pinned to an exact release tag at implementation time
+- Network: the Compose default bridge network; reaches Postgres at `postgres:5432` by service name
+- Published port: `3000`
+- Volumes: `./grafana/provisioning` → `/etc/grafana/provisioning` (read-only), `${TERRARIUM_DATA}/grafana-data` → `/var/lib/grafana`
+- Admin credentials from `.env` (`GF_SECURITY_ADMIN_USER`, `GF_SECURITY_ADMIN_PASSWORD`)
+- Datasource password injected through provisioning: `${HASS_READONLY_PASSWORD}`
+- Default timezone for viewers: browser (data is stored in UTC)
+
+All three services use `restart: unless-stopped`. With the Docker daemon enabled at boot (the default on Ubuntu), that is enough to bring the stack back after a reboot. No systemd unit is needed.
 
 ### Backup Script
 
-- Location: `scripts/backup.sh`
-- Produces: compressed `pg_dump` at `$BACKUP_TARGET/terrarium-YYYY-MM-DD.sql.gz`
-- Rotation: keeps last 30 dumps, deletes older ones
-- Target: configured via `BACKUP_TARGET` in `.env` — any writable local path
-- Not scheduled in Phase A — run manually to verify, wire up cron in a later phase
+- `scripts/backup.sh` produces two files in `$BACKUP_TARGET`:
+  - `terrarium-db-YYYY-MM-DD.sql.gz` — via `docker compose exec -T postgres pg_dump -U hass homeassistant | gzip` (no Postgres client needed on the host)
+  - `terrarium-ha-config-YYYY-MM-DD.tar.gz` — the HA config directory, including `.storage/` and `secrets.yaml`
+- Rotation keeps the last 30 of each
+- Exits with an error if `BACKUP_TARGET` is unset or not writable
+- The archive contains secrets. `BACKUP_TARGET` must be a location you trust as much as the server itself
+- Not scheduled in Phase A
+
+### Restore Test
+
+`scripts/restore-test.sh` starts a throwaway `postgres:17` container with no volume, loads the latest dump into it, compares the `states` row count with the live database, and removes the container. A backup counts as working only once this passes.
 
 ---
 
-## HA Recorder Configuration
+## HA Configuration Template
 
-Key decisions in `ha-config/configuration.yaml`:
+`ha-config/configuration.yaml` in the repo is copied into the data root once by `setup.sh`. After that, edits happen in the data-root copy.
 
 ```yaml
+default_config:
+
 recorder:
-  db_url: !env_var HA_DB_URL
+  db_url: !secret recorder_db_url
   purge_keep_days: 730
   commit_interval: 5
   exclude:
@@ -144,84 +217,114 @@ recorder:
       - sensor.*_rssi
 ```
 
-- `HA_DB_URL` is injected from `.env` — no credentials in the config file
-- `730` days retention — two years of history from day one
-- `commit_interval: 5` — writes to Postgres every 5 seconds, reducing I/O without losing data
-- Exclusions remove high-frequency noise that doesn't have analytical value
+- `secrets.yaml` is generated by `setup.sh` in the data root, never in the repo
+- `730` days of state history. Long-term statistics (hourly mean/min/max, and cumulative `sum` for energy) are kept indefinitely regardless of this setting
+- `commit_interval: 5` — batches writes every 5 seconds
 
 ---
 
 ## Grafana Dashboard — MVP
 
-One dashboard, two sections.
+### HA recorder schema notes
 
-### Shelly Power Section
+The dashboard queries HA's tables directly, so they have to match the current recorder schema:
+
+- `states` has no `entity_id` column. Entities live in `states_meta`; join on `metadata_id`
+- The timestamp is `last_updated_ts`, a Unix epoch in seconds (double precision). `last_updated` is no longer populated
+- `state` is text. Cast it, and exclude `unavailable` and `unknown`
+- Long-term statistics live in `statistics`, keyed by `metadata_id` → `statistics_meta.statistic_id` (the entity ID), timestamped by `start_ts`
+- For energy sensors, `statistics.sum` is cumulative. A day's energy is the change in `sum` across the day, not a sum of rows
+
+### No hardcoded entity IDs
+
+A dashboard variable `plug_power` lists the Shelly power sensors by querying `states_meta`:
+
+```sql
+SELECT entity_id FROM states_meta
+WHERE entity_id LIKE 'sensor.%' AND entity_id LIKE '%power'
+ORDER BY entity_id;
+```
+
+Panels reference `$plug_power` instead of literal entity IDs, so the provisioned dashboard works on any install without patching the JSON. If the pattern catches unrelated sensors, narrow it to the Shelly naming prefix.
+
+### Panels
 
 | Panel | Type | Query basis |
 |---|---|---|
-| Plug 1 — current watts | Stat | Latest `state` for Shelly plug 1 power entity |
-| Plug 2 — current watts | Stat | Latest `state` for Shelly plug 2 power entity |
-| Power over time — both plugs | Time series | `states` joined to `states_meta` by entity_id, last 24h |
-| Daily energy totals — last 7 days | Bar chart | `statistics` table, daily sum per plug |
-| Combined household draw | Time series | Sum of both plugs, last 24h |
+| Current watts (one per plug, repeated by variable) | Stat | Latest non-null `state::numeric` per entity, by `last_updated_ts` |
+| Power over time | Time series | `states` ⋈ `states_meta`, `to_timestamp(last_updated_ts)`, time-filtered |
+| Daily energy — last 7 days | Bar chart | `statistics` ⋈ `statistics_meta`, per-day change in `sum` |
+| Combined draw | Time series | Both plugs summed per time bucket |
+| State changes today | Stat | `COUNT(*)` from `states` where `last_updated_ts >= extract(epoch from date_trunc('day', now()))` |
+| Total rows in `states` | Stat | `COUNT(*)` from `states` |
+| Most recent state change | Stat | `to_timestamp(MAX(last_updated_ts))` |
 
-### Recorder Health Section
+Example — power over time:
 
-| Panel | Type | Query basis |
-|---|---|---|
-| State changes today | Stat | `COUNT(*)` from `states` where `last_updated > today` |
-| Total rows in states table | Stat | `COUNT(*)` from `states` |
-| Most recent state change | Stat | `MAX(last_updated)` from `states` |
+```sql
+SELECT
+  to_timestamp(s.last_updated_ts) AS time,
+  sm.entity_id AS metric,
+  s.state::numeric AS value
+FROM states s
+JOIN states_meta sm ON sm.metadata_id = s.metadata_id
+WHERE sm.entity_id IN ($plug_power)
+  AND s.state ~ '^-?[0-9.]+$'
+  AND s.last_updated_ts BETWEEN $__unixEpochFrom() AND $__unixEpochTo()
+ORDER BY 1;
+```
 
 ---
 
 ## Environment Variables
 
-All secrets and environment-specific config live in `~/.config/terrarium/.env`. Never committed to the repo. `.env.example` in the repo root documents every variable with a description and safe default.
+All secrets and settings live in `~/.config/terrarium/.env`. The repo's `.env` is a symlink to it (gitignored), so Docker Compose finds it for `${VAR}` substitution and services load it with `env_file: .env`. `.env.example` documents every variable.
 
 | Variable | Used by | Description |
 |---|---|---|
-| `POSTGRES_PASSWORD` | Postgres, HA, Grafana | Password for the `hass` user |
-| `POSTGRES_READONLY_PASSWORD` | Grafana | Password for the `hass_readonly` user |
-| `HA_DB_URL` | HA recorder | Full Postgres connection string for HA |
+| `TERRARIUM_DATA` | Compose volumes, scripts | Absolute path to the data root, e.g. `/home/<you>/.local/share/terrarium` |
+| `POSTGRES_PASSWORD` | Postgres | Superuser password — admin use only; no service connects as `postgres` |
+| `HASS_DB_PASSWORD` | init.sh, setup.sh | Password for `hass`; setup.sh writes it into HA's `secrets.yaml` |
+| `HASS_READONLY_PASSWORD` | init.sh, Grafana | Password for `hass_readonly` |
 | `GF_SECURITY_ADMIN_USER` | Grafana | Grafana admin username |
 | `GF_SECURITY_ADMIN_PASSWORD` | Grafana | Grafana admin password |
-| `BACKUP_TARGET` | backup.sh | Absolute path to backup destination directory |
-| `TZ` | All containers | Timezone — e.g. `America/Los_Angeles` |
-| `SERVER_IP` | setup.sh | LAN IP of the server |
+| `BACKUP_TARGET` | backup.sh | Absolute path to the backup directory |
+| `TZ` | All containers | `UTC` |
+| `SERVER_IP` | setup.sh | The server's static LAN IP |
 
 ---
 
 ## Network
 
-All services communicate over a single Docker bridge network (`terrarium`). No services are exposed to the internet. Ports exposed to the host:
+| Service | Network | Reaches Postgres at | Host exposure |
+|---|---|---|---|
+| `postgres` | Compose bridge | — | `127.0.0.1:5432` only |
+| `homeassistant` | Host | `127.0.0.1:5432` | `8123` on the LAN |
+| `grafana` | Compose bridge | `postgres:5432` | `3000` on the LAN |
 
-| Service | Host port | Purpose |
-|---|---|---|
-| `homeassistant` | host network | Required for mDNS / Shelly discovery |
-| `grafana` | `3000` | Dashboard UI |
-| `postgres` | `5432` (localhost only) | Direct DB access for debugging |
+Nothing is exposed beyond the LAN. Remote access is Phase E.
 
 ---
 
 ## Known Constraints and Gotchas
 
-**HA must use host network mode.** Without it, HA cannot perform mDNS discovery to find Shelly devices. This is a known requirement for HA Container on Linux.
+**Shelly stability.** One of the plugs has already had spontaneous reboots and been replaced once. Update both to current firmware before Phase A. Reboots show up as gaps and `unavailable` states in Grafana that look like recorder bugs. If they continue, note the timestamps — the recorder will capture them, which is useful evidence for a support ticket.
 
-**Postgres init script only runs on first start.** If you need to re-run `db/init.sql` (e.g. to add a role), you must either delete the data volume and restart, or run the SQL manually via `docker exec`.
+**Init only runs once.** `db/init.sh` runs only against an empty data directory. Changing roles later means running SQL by hand through `docker compose exec postgres psql -U postgres -d homeassistant`.
 
-**Grafana entity IDs in queries are environment-specific.** The dashboard JSON uses Shelly entity IDs that will be specific to your HA instance. The setup script should prompt for these and patch the dashboard JSON at install time, or the dashboard should use HA-agnostic queries where possible. This is a known rough edge for Phase A.
+**Host network and service names.** HA cannot use Compose service names. Anything HA connects to on the Compose network must be published to the host and addressed as `127.0.0.1`.
 
-**SQLite migration is not needed.** Because HA is pointed at Postgres from first boot, there is no SQLite data to migrate. If HA has previously been run on this machine with SQLite, the old database is left untouched and ignored.
+**`~` in paths.** Never use `~` in `docker-compose.yml`. Use `${TERRARIUM_DATA}`.
+
+**Compose project name.** Container names depend on the clone's directory name. Use `docker compose exec <service>` rather than `docker exec <container-name>` in scripts and docs.
+
+**`.storage` is state, not config.** Back it up with the database. Never commit it.
 
 ---
 
 ## Definition of Done
 
-Phase A is done when:
-
-1. All success criteria are checked off
-2. A reinstall test has been performed and passed
-3. `scripts/backup.sh` has been run manually and output verified
-4. Both files — `DESIGN.md` and `README.md` — reflect Phase A as complete
-5. A git tag `phase-a` is applied to the commit
+1. Every success criterion is checked off
+2. The restore, reinstall, and reboot tests have all passed on the real server
+3. `README.md` marks Phase A complete
+4. A git tag `phase-a` is applied to the commit

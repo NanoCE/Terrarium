@@ -49,20 +49,20 @@ Your home data stays on your hardware. LLM inference runs on your server via Oll
 - 🔍 **Full audit trail** — ask why anything happened; the system answers from its own logs
 - 🔒 **VPN-first remote access** — your data, your network, your rules
 - 📊 **Grafana dashboard** — out-of-the-box panels for all sensor and query data
-- 🔄 **Clean reinstall** — preserve your Postgres volume, wipe everything else, back up and running in minutes
+- 🔄 **Clean reinstall** — all runtime data lives in one directory outside the repo; keep it, re-clone everything else, back up and running in minutes
 
 ---
 
 ## Architecture Overview
 
 ```
-Voice Device (ESP32)
-    → Wyoming Protocol
+Voice satellite (ESPHome)
+    → Home Assistant Assist pipeline
         → Whisper (STT) → Intent Router → Piper (TTS)
                                │
                     ┌──────────┼──────────┐
                     ▼          ▼          ▼
-              Lookup Table   HA API    Ollama
+              Lookup Table  HA intents  Ollama
                     │                    │
                     └──────┬─────────────┘
                            ▼
@@ -82,22 +82,23 @@ Terrarium is designed in capability tiers. Each tier is independently useful —
 | Tier | Requires | What you get |
 |---|---|---|
 | 1 — Core | Any modern PC, Ubuntu | HA + Postgres + energy/air monitoring + Grafana |
-| 2 — Voice | ESP32-S3-BOX-3 or similar | Local voice assistant, replaces Google Home |
-| 3 — AI | Decent CPU or any GPU | LLM fallback, self-curation, automation proposals |
-| 4 — Presence | ESP32 BLE nodes, room sensors | Room-level location, presence-aware automations |
-| 5 — Remote | VPN or Cloudflare Tunnel | Secure access from anywhere |
+| 2 — Voice | Voice PE or similar satellite | Local voice assistant, replaces Google Home |
+| 3 — AI | Decent CPU or any GPU | LLM fallback, self-curation, automation proposals, audit answers |
+| 4 — Remote | VPN or Cloudflare Tunnel | Secure access from anywhere |
+| 5 — Presence | ESP32 BLE nodes, room sensors, Tier 4 | Room-level location, presence-aware automations |
 
-**Tested server configuration:**
+**Reference server (planned):**
 - AMD Ryzen 5 7600X, 32GB DDR5, Ubuntu 24.04
-- GPU optional — RTX 3070 Ti (8GB VRAM) when available improves LLM response times 5-10x
+- GPU optional — an RTX 3070 Ti (8GB VRAM) makes local LLM responses several times faster
 
-**Phase 1 devices:**
-- Shelly Plug S 4th Gen (power monitoring, WiFi, fully local)
-- IKEA ALPSTUGA air quality sensor (Thread/Matter)
-- SONOFF Zigbee 3.0 Dongle Lite #1 (EFR32MG21) — flashed to OpenThread RCP firmware, acts as Thread border router for ALPSTUGA
-- SONOFF Zigbee 3.0 Dongle Lite #2 (EFR32MG21) — flashed to Zigbee coordinator firmware (Phase 2, buy alongside #1)
+**Phase A devices:**
+- Shelly Plug S 4th Gen ×2 (power monitoring, WiFi, fully local)
 
-> **Note:** IPv6 must be enabled on your LAN for Thread to work. Verify this before Phase 1 setup.
+**Phase B devices:**
+- IKEA ALPSTUGA air quality sensor (Matter over Thread)
+- SONOFF Zigbee 3.0 Dongle Lite (EFR32MG21), flashed to OpenThread RCP firmware as the Thread radio
+
+> **Thread note:** The server needs specific IPv6 settings to route into the Thread network, and adding Matter devices goes through the HA Companion app on your phone. See [DESIGN.md §3.4](./DESIGN.md#34-smart-devices--phase-b).
 
 ---
 
@@ -108,10 +109,9 @@ Terrarium is designed in capability tiers. Each tier is independently useful —
 ### Prerequisites
 
 - Ubuntu 24.04 LTS (other Linux distributions should work; untested)
-- Docker + Docker Compose
+- Docker Engine + the Compose plugin
 - Git
-- 2× SONOFF Zigbee 3.0 Dongle Lite (EFR32MG21) — one for Thread, one for Zigbee
-- IPv6 enabled on your LAN (required for Thread/Matter)
+- For Phase B: one SONOFF Zigbee 3.0 Dongle Lite (EFR32MG21) and the HA Companion app on your phone
 
 ### Quick Start
 
@@ -122,7 +122,7 @@ cd terrarium
 docker compose up -d
 ```
 
-The setup script will walk you through initial configuration and write your `.env` file.
+The setup script writes your `.env` outside the repo, creates the data directory, and seeds Home Assistant's config. The repo itself never holds runtime data — you can delete and re-clone it at any time. For the full walkthrough, see [PHASE-A-GUIDE.md](./PHASE-A-GUIDE.md).
 
 ### Home Assistant
 
@@ -146,19 +146,23 @@ ESPHome configs for supported devices live in `esphome/`. See [docs/setup-esphom
 terrarium/
 ├── README.md
 ├── DESIGN.md                 # full system design document
+├── PHASE-A.md                # phase design docs + step-by-step guides
+├── PHASE-A-GUIDE.md
 ├── docker-compose.yml
 ├── .env.example
-├── scripts/                  # setup, backup, migration
+├── scripts/                  # setup, backup, restore test
+├── db/                       # init script, later Alembic migrations
+├── ha-config/                # Home Assistant config templates
+├── grafana/                  # provisioned datasources and dashboards
 ├── services/
 │   ├── intent-router/        # voice query handler (hot path)
+│   ├── notification-worker/  # proactive alerts
+│   ├── ha-observer/          # automation trace capture for audit queries
 │   ├── curation-worker/      # background LLM jobs
 │   ├── read-api/             # read-only data API
-│   ├── presence-worker/      # presence fusion
-│   └── notification-worker/  # proactive alerts
-├── db/                       # Alembic migrations
+│   └── presence-worker/      # presence fusion
 ├── prompts/                  # versioned LLM system prompts
-├── ha-config/                # Home Assistant configuration
-├── esphome/                  # voice satellite firmware configs
+├── esphome/                  # voice satellite and presence node configs
 └── docs/                     # setup guides per component
 ```
 
@@ -166,19 +170,18 @@ terrarium/
 
 ## Wake Word
 
-The default wake word is **"Hey Terra"**.
-
-Configurable per device in ESPHome config. Custom wake word training via OpenWakeWord is supported — see [docs/setup-esphome.md](./docs/setup-esphome.md).
+The planned wake word is **"Hey Terra"**. It needs a custom-trained microWakeWord model, so Terrarium ships with the stock `okay_nabu` until that model exists. The wake word is configurable per device in ESPHome — see [docs/setup-esphome.md](./docs/setup-esphome.md).
 
 ---
 
 ## Roadmap
 
-- [ ] **Phase A — MVP:** HA Container, PostgreSQL, Shelly ×2, Grafana, recorder, backup infrastructure
-- [ ] **Phase B — Sensors:** ALPSTUGA air quality via SONOFF Thread dongle + OTBR + Matter server
-- [ ] **Phase C — Voice:** Zigbee dongle, Whisper, Piper, ESP32-S3-BOX-3 satellites, intent router
-- [ ] **Phase D — AI:** Ollama, curation worker, automation proposals, audit query answering
+- [ ] **Phase A — MVP:** HA Container, PostgreSQL, Shelly ×2, Grafana, recorder, backup with a tested restore
+- [ ] **Phase B — Sensors:** ALPSTUGA air quality via SONOFF Thread dongle + OTBR + matterjs-server
+- [ ] **Phase C — Voice:** Whisper, Piper, Voice PE satellite, intent router, spoken notifications, "Hey Terra" wake word
+- [ ] **Phase D — AI:** Ollama, automation trace capture, curation worker, automation proposals, audit query answering
 - [ ] **Phase E — Remote:** VPN/Cloudflare Tunnel, read API, control UI
+- [ ] **Phase F — Presence:** MQTT, ESPresense, presence fusion, room-level speaker routing
 
 See [DESIGN.md §20](./DESIGN.md#20-implementation-phases) for the full phase breakdown.
 
